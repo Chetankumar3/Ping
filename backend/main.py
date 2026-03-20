@@ -22,18 +22,14 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 
 async def init_db():
     async with engine.begin() as conn:
-        # This safely runs the synchronous table creation inside the async engine
         await conn.run_sync(DB_models.Base.metadata.create_all)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # --- STARTUP LOGIC ---
-    # Everything before the 'yield' runs exactly once when the server boots up.
     print("Booting up: Ensuring database tables exist...")
     await init_db()
 
-    yield  # The server pauses here and handles all user requests/websockets
-    # --- SHUTDOWN LOGIC ---
+    yield
     print("Shutting down gracefully...")
 app = FastAPI(lifespan=lifespan)
 
@@ -63,10 +59,11 @@ async def login(token: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="Invalid token")
 
     try:
-        user = await db.execute(
+        user = await db.scalars(
                         select(DB_models.OAuthTable.UserId)
                         .where(DB_models.OAuthTable.OAuthId==IdInfo["sub"])
-                    ).scalar()
+                    )
+        user = user.all()
     
         if not user:
             user_ = DB_models.User(
@@ -97,22 +94,25 @@ async def login(token: str, db: Session = Depends(get_db)):
 @app.get("/ws/{UserId}/get_all_messages")
 async def get_all_messages(UserId: int, db: Session = Depends(get_db)):
     try:
-        Messages = await db.execute(
+        Messages = await db.scalars(
             select(DB_models.Message)
             .where(or_(DB_models.Message.FromId==UserId, DB_models.Message.ToId==UserId))
-        ).scalars().all()
+        )
+        Messages = Messages.all()
 
-        Groups = await db.execute(
+        Groups = await db.scalars(
             select(DB_models.MapTable.GroupId)
             .where(DB_models.MapTable.UserId == UserId)
-        ).scalars().all()
+        )
+        Groups = Groups.all()
 
-        GroupMessages = await db.execute(
+        GroupMessages = await db.scalars(
             select(DB_models.GroupMessage)
             .where(DB_models.GroupMessage.GroupId.in_(Groups))
-        ).scalars().all()
+        )
+        GroupMessages = GroupMessages.all()
 
-        return [Messages, GroupMessages]
+        return {"Messages": Messages, "GroupMessages": GroupMessages}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -130,14 +130,22 @@ async def change_username(UserId: int, NewUsername: str, db: Session = Depends(g
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/get_all_users")
+async def get_all_users(db: Session = Depends(get_db)):
+    try:
+        result = await db.scalars(select(DB_models.User.Id, DB_models.User.Username))
+        return {"Users": result.mappings().all()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.websocket("/ws/{Username}")
 async def websocket_endpoint(websocket_: WebSocket, Username: str):
     UserId: 0
     async with SessionLocal() as db:
-        UserId = await db.execute(
+        UserId = await db.scalar(
             select(DB_models.User.Id)
             .where(DB_models.User.Username == Username)
-        ).scalar()
+        )
 
     if not UserId:
         websocket_.close(code=1008)
@@ -148,7 +156,6 @@ async def websocket_endpoint(websocket_: WebSocket, Username: str):
         while True:
             message = await websocket_.receive_json()
 
-            AllUsers = []
             async with SessionLocal() as db:
                 if message["Type"]==0:
                     Message = DB_models.Message(
@@ -160,11 +167,6 @@ async def websocket_endpoint(websocket_: WebSocket, Username: str):
                     db.add(Message)
                     await db.commit()
                 elif message["Type"]==1:
-                    Group = await db.execute(
-                        select(DB_models.MapTable.UserId)
-                        .where(DB_models.MapTable.GroupId == message["ToId"])
-                    ).scalars().all()
-
                     GroupMessage = DB_models.Message(
                         FromId=message["FromId"],
                         ToId=message["ToId"],
@@ -173,23 +175,22 @@ async def websocket_endpoint(websocket_: WebSocket, Username: str):
                     )
                     db.add(GroupMessage)
                     await db.commit()
-                elif message["Type"]==2:
-                    rows = await db.execute(
-                        select(DB_models.User.Username, DB_models.User.UserId)
-                    )
-                    AllUsers = [{"Username": row.Username, "Id": row.Id} for row in rows.all()]             
 
             if message["Type"]==0:
                 await manager.send_message(message, message["ToId"])
+
             elif message["Type"]==1:
+                Group = await db.scalars(
+                        select(DB_models.MapTable.UserId)
+                        .where(DB_models.MapTable.GroupId == message["ToId"])
+                    )
+                Group = Group.all()
+
                 Tasks = [manager.send_message(message, To_) for To_ in Group]
                 await asyncio.gather(*Tasks)
-            elif message["Type"]==2:
-                await manager.send_message(AllUsers, message["UserId"])
 
     except WebSocketDisconnect:
         await manager.disconnect(websocket_, UserId)
-
 '''
 Left:
 - Receive time updation
