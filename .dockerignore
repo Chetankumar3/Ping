@@ -1,0 +1,24 @@
+# Git
+.git
+.gitignore
+
+# Node/Frontend
+frontend/node_modules
+npm-debug.log
+# Ignore local builds so you don't accidentally copy them instead of building fresh
+frontend/dist 
+
+# Python/Backend
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment variables & Secrets
+.env
+.env.*
+*.pem
+
+# IDEs and OS files
+.vscode/
+.idea/
+.DS_Store

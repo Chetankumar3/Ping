@@ -3,55 +3,50 @@ import asyncio
 import subprocess
 import redis.asyncio as redis
 
-# Global variables with Docker fallbacks
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 NGINX_CONF_PATH = os.getenv("NGINX_CONF_PATH", "/etc/nginx/conf.d/default.conf")
-POLL_INTERVAL = 10  # seconds
+POLL_INTERVAL = 10
 
-# Template with double braces {{ }} to escape them for Python's .format()
-NGINX_TEMPLATE = """http {{
-    upstream main-service {{
-        least_conn;
+# Removed 'http {}' wrapper. This will drop cleanly into conf.d/
+NGINX_TEMPLATE = """upstream main-service {{
+    least_conn;
 {main_servers}
-    }}
+}}
 
-    upstream cm-service {{
-        least_conn;
+upstream cm-service {{
+    least_conn;
 {cm_servers}
+}}
+
+server {{
+    listen 80;
+    location / {{
+        return 301 /ping/;
     }}
 
-    server {{
-        listen 80;
-        location / {{
-            return 301 /ping/;
-        }}
+    location /ping/ {{
+        alias /usr/share/nginx/html/;
+        index index.html;
+        try_files $uri $uri/ /ping/index.html;
+    }}
 
-        location /ping/ {{
-            alias /usr/share/nginx/html/;
-            index index.html;
-            try_files $uri $uri/ /ping/index.html;
-        }}
+    location /main_service/ {{
+        proxy_pass http://main-service;
+    }}
 
-        location /main_service/ {{
-            proxy_pass http://main-service;
-        }}
+    location /cm_service/ {{
+        proxy_pass http://cm-service;
+        
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
 
-        location /cm_service/ {{
-            proxy_pass http://cm-service;
-            
-            # Websocket specific directives
-            proxy_http_version 1.1;
-            proxy_set_header Upgrade $http_upgrade;
-            proxy_set_header Connection "upgrade";
-            proxy_read_timeout 300s;
-            proxy_send_timeout 300s;
-
-            # Logging and debugging headers
-            proxy_set_header Host $host;
-            proxy_set_header X-Real-IP $remote_addr;
-            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-            proxy_set_header X-Forwarded-Proto $scheme;
-        }}
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
     }}
 }}"""
 
@@ -62,19 +57,16 @@ async def get_servers(r: redis.Redis, service_type: str) -> list[str]:
         cursor, keys = await r.scan(cursor, match=f"service:{service_type}:*")
         if keys:
             addresses = await r.mget(keys)
-            # Filter out None values in case keys expired between scan and mget
             servers.extend([addr.decode('utf-8') for addr in addresses if addr])
         if cursor == 0:
             break
     return servers
 
 def reload_nginx():
-    """Test syntax and trigger NGINX reload."""
     try:
-        # Step 1: Validate syntax before applying
-        subprocess.run(["nginx", "-t", "-c", NGINX_CONF_PATH], check=True, capture_output=True)
-        # Step 2: Issue reload signal
-        subprocess.run(["nginx", "-s", "reload", "-c", NGINX_CONF_PATH], check=True, capture_output=True)
+        # Removed the '-c' flag. Let NGINX use its default root config.
+        subprocess.run(["nginx", "-t"], check=True, capture_output=True)
+        subprocess.run(["nginx", "-s", "reload"], check=True, capture_output=True)
         print("NGINX reloaded successfully.")
     except subprocess.CalledProcessError as e:
         print(f"NGINX reload failed.\nStdout: {e.stdout.decode()}\nStderr: {e.stderr.decode()}")
@@ -86,16 +78,14 @@ async def service_watcher():
 
     while True:
         try:
-            main_servers = await get_servers(r, "main_http") # Match your register_service input
+            main_servers = await get_servers(r, "main_http")
             cm_servers = await get_servers(r, "cm_http")
 
             current_main = set(main_servers)
             current_cm = set(cm_servers)
 
-            # Only rewrite and reload if the infrastructure state changed
             if current_main != last_main_servers or current_cm != last_cm_servers:
                 
-                # Format server strings. Use a dummy down server if empty to prevent syntax errors.
                 main_lines = "\n".join([f"        server {addr} max_fails=8 fail_timeout=10s;" for addr in main_servers]) or "        server 127.0.0.1:65535 down;"
                 cm_lines = "\n".join([f"        server {addr} max_fails=8 fail_timeout=10s;" for addr in cm_servers]) or "        server 127.0.0.1:65535 down;"
 
@@ -104,7 +94,6 @@ async def service_watcher():
                     cm_servers=cm_lines
                 )
 
-                # Overwrite config
                 with open(NGINX_CONF_PATH, "w") as f:
                     f.write(new_conf)
 
